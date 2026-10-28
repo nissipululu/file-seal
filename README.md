@@ -106,7 +106,7 @@ dotnet run --project SonsetSeal.Tests -c Release -- --with-store   # also runs t
 bash package.sh ./release                                   # Mac program and installer package, Windows zip, SHA256SUMS
 ```
 
-There are no outside packages. The program uses only what ships with .NET, so there is nothing else to download, audit or keep up to date. The SDK version is pinned in `global.json`, and two builds from the same source give the same file byte for byte.
+There are no outside packages. The program uses only what ships with .NET, so there is nothing else to download, audit or keep up to date. The SDK version is pinned in `global.json`, and two builds from the same source give the same program and the same Windows zip, byte for byte. The Mac installer package is the one exception: it records the time it was built, so its own fingerprint differs from build to build, while the program inside it stays the same.
 
 ## Reporting a problem
 

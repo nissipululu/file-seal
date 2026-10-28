@@ -22,7 +22,9 @@ rm -rf "$OUT/pkgroot" && mkdir -p "$OUT/pkgroot/usr/local/bin"
 cp "$OUT/osx-arm64/sonsetseal" "$OUT/pkgroot/usr/local/bin/sonsetseal"
 chmod 755 "$OUT/pkgroot/usr/local/bin/sonsetseal"
 xattr -cr "$OUT/pkgroot" 2>/dev/null || true
-# A fixed date on every file that goes into an archive, so the same source gives the same package and zip, not only the same program.
+# A fixed date on every file that goes into an archive, so the same source gives the same zip, not only the same program.
+# The Mac package is the exception. What is inside it is the same every time, but pkgbuild writes its own build time into the
+# package file, so the package's fingerprint changes with every build. The fingerprint of the program inside it does not.
 STAMP=202601010000
 find "$OUT/pkgroot" -exec touch -t "$STAMP" {} + 2>/dev/null || true
 pkgbuild --root "$OUT/pkgroot" --identifier ca.sonset.sealtool --version "$VERSION" --install-location / \
