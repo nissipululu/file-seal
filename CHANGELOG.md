@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.4.1
+
+A small release on top of 0.4.0. A box that stops on Windows now starts again by itself, and the automated checks pass on Windows.
 
 Windows
 
@@ -8,6 +10,7 @@ Windows
 - The Startup file is written so that user names with accents, such as José, work.
 - `uninstall` also stops the box of a login item that it only finds in the Startup folder.
 - All the automated checks pass on Windows (358 of 358, and 377 on a Mac). The earlier failures were four wrong tests, not faults in the program: a file name Windows refuses, a hidden file rule, a file that cannot be replaced while it is open, and a difference in wording. One new check now judges partly downloaded files the same way on both systems.
+- The Windows zip is now the same bytes every time it is built from the same source, like the two programs already were.
 
 ## 0.4.0 (first public release)
 

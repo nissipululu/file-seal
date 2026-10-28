@@ -35,7 +35,7 @@ Anything else is refused with a reason: no seal, a damaged seal, an edited file,
 
 ## Status
 
-Version 0.4.0, the first public release.
+Version 0.4.1. The first public release was 0.4.0; 0.4.1 adds the Windows restart.
 
 | Part | State |
 | --- | --- |

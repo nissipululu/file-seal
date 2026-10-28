@@ -22,6 +22,9 @@ rm -rf "$OUT/pkgroot" && mkdir -p "$OUT/pkgroot/usr/local/bin"
 cp "$OUT/osx-arm64/sonsetseal" "$OUT/pkgroot/usr/local/bin/sonsetseal"
 chmod 755 "$OUT/pkgroot/usr/local/bin/sonsetseal"
 xattr -cr "$OUT/pkgroot" 2>/dev/null || true
+# A fixed date on every file that goes into an archive, so the same source gives the same package and zip, not only the same program.
+STAMP=202601010000
+find "$OUT/pkgroot" -exec touch -t "$STAMP" {} + 2>/dev/null || true
 pkgbuild --root "$OUT/pkgroot" --identifier ca.sonset.sealtool --version "$VERSION" --install-location / \
   "$OUT/SonsetSeal-$VERSION-mac.pkg" > /dev/null 2> >(grep -v 'write: Permission denied' >&2)
 # (On this Mac pkgbuild prints 'write: Permission denied' and adds harmless ._ attribute files, because macOS marks every
@@ -29,7 +32,8 @@ pkgbuild --root "$OUT/pkgroot" --identifier ca.sonset.sealtool --version "$VERSI
 
 # Windows: the program in a zip. No installer script on purpose, many companies run scripts in a restricted mode.
 rm -f "$OUT/SonsetSeal-$VERSION-windows-x64.zip"
-( cd "$OUT/win-x64" && zip -q "../SonsetSeal-$VERSION-windows-x64.zip" sonsetseal.exe )
+touch -t $STAMP "$OUT/win-x64/sonsetseal.exe"
+( cd "$OUT/win-x64" && zip -X -q "../SonsetSeal-$VERSION-windows-x64.zip" sonsetseal.exe )
 
 MAC_HASH="$(shasum -a 256 "$OUT/osx-arm64/sonsetseal" | cut -d' ' -f1)"
 WIN_HASH="$(shasum -a 256 "$OUT/win-x64/sonsetseal.exe" | cut -d' ' -f1)"
