@@ -54,6 +54,7 @@ public static partial class Boxes
     /// <summary>
     /// Held for as long as a box is running. A second copy of the same box (one started by hand while the login item runs, say)
     /// cannot take it, so two copies never race to move the same files. The lock goes away by itself if the program is killed.
+    /// The same lock, under the name "supervisor", lets only one supervisor (see Supervise) look after a box.
     /// </summary>
     public sealed class BoxLock : IDisposable
     {
@@ -62,43 +63,75 @@ public static partial class Boxes
 
         private BoxLock(FileStream stream, string pidPath) { _stream = stream; _pidPath = pidPath; }
 
-        public static string PidFile(string folder) => Path.Combine(Path.GetFullPath(folder), "box.pid");
+        public static string PidFile(string folder, string kind = "box") => Path.Combine(Path.GetFullPath(folder), kind + ".pid");
 
         /// <summary>Null when another copy already holds this box.</summary>
-        public static BoxLock? TryTake(string folder)
+        public static BoxLock? TryTake(string folder, string kind = "box")
         {
             var root = Path.GetFullPath(folder);
             Directory.CreateDirectory(root);
             FileStream stream;
-            try { stream = new FileStream(Path.Combine(root, "box.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+            try { stream = new FileStream(Path.Combine(root, kind + ".lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
             catch (IOException) { return null; }
-            File.WriteAllText(PidFile(root), Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            return new BoxLock(stream, PidFile(root));
+            File.WriteAllText(PidFile(root, kind), Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            return new BoxLock(stream, PidFile(root, kind));
         }
 
         public void Dispose()
         {
-            _stream.Dispose();
+            // The pid file goes first: once the lock is let go, another copy may take it and write its own pid file at once.
             try { File.Delete(_pidPath); } catch (Exception e) when (e is IOException or UnauthorizedAccessException) { }
+            _stream.Dispose();
         }
     }
 
-    /// <summary>Stops the copy of this program that a box's pid file names, if that really is a copy of this program. True when one was stopped.</summary>
-    private static bool StopFromPidFile(string folder)
+    /// <summary>The copy of this program that a pid file names, if that really is a copy of this program. A number reused by some other program is not.</summary>
+    internal static Process? ProcessOfPidFile(string pidPath)
     {
         try
         {
-            var pidPath = BoxLock.PidFile(folder);
-            if (!File.Exists(pidPath) || !int.TryParse(File.ReadAllText(pidPath).Trim(), out var pid) || pid == Environment.ProcessId) return false;
-            using var process = Process.GetProcessById(pid);
+            if (!File.Exists(pidPath) || !int.TryParse(File.ReadAllText(pidPath).Trim(), out var pid) || pid == Environment.ProcessId) return null;
+            var process = Process.GetProcessById(pid);
             var ours = Path.GetFileNameWithoutExtension(Environment.ProcessPath ?? "");
             // A process that started after the pid file was written is some other program that reused the number.
-            if (!string.Equals(process.ProcessName, ours, StringComparison.OrdinalIgnoreCase) || process.StartTime.ToUniversalTime() > File.GetLastWriteTimeUtc(pidPath).AddSeconds(10)) return false;
+            if (!string.Equals(process.ProcessName, ours, StringComparison.OrdinalIgnoreCase) || process.StartTime.ToUniversalTime() > File.GetLastWriteTimeUtc(pidPath).AddSeconds(10))
+            {
+                process.Dispose();
+                return null;
+            }
+            return process;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException or System.ComponentModel.Win32Exception or NotSupportedException)
+        { return null; }
+    }
+
+    private static bool StopPidFileProcess(string pidPath)
+    {
+        using var process = ProcessOfPidFile(pidPath);
+        if (process == null) return false;
+        try
+        {
             process.Kill();
             process.WaitForExit(5000);
             return true;
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException or System.ComponentModel.Win32Exception or NotSupportedException)
+        catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException)
         { return false; }
+    }
+
+    /// <summary>Stops the supervisor that looks after a box and then the box itself (the supervisor first, so it cannot start the box again). True when one was stopped.</summary>
+    internal static bool StopFromPidFile(string folder)
+    {
+        var stopped = StopPidFileProcess(BoxLock.PidFile(folder, "supervisor"));
+        return StopPidFileProcess(BoxLock.PidFile(folder)) | stopped;
+    }
+
+    /// <summary>Gives a supervisor that has been told to go (its login item file is gone) a moment to end the box and itself. True when it ended.</summary>
+    internal static bool WaitForSupervisorToEnd(string folder, TimeSpan patience)
+    {
+        using var process = ProcessOfPidFile(BoxLock.PidFile(folder, "supervisor"));
+        if (process == null) return false;
+        try { return process.WaitForExit((int)patience.TotalMilliseconds); }
+        catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException) { return false; }
     }
 }

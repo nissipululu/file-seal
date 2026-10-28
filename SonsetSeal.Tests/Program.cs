@@ -10,6 +10,14 @@ using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using SonsetSeal;
 
+// A copy of this program that only sits and waits. A test starts one to stand in for a box or a supervisor, so that stopping by pid file can be proved on a real process with our own name.
+if (args.Length >= 2 && args[0] == "--idle-copy")
+{
+    if (args.Length > 2) File.WriteAllText(args[2], Environment.ProcessId.ToString());   // so a test can find the process it started
+    Thread.Sleep(TimeSpan.FromSeconds(int.Parse(args[1])));
+    return 0;
+}
+
 var skipStore = !args.Contains("--with-store");
 var results = new List<(string Name, bool Ok)>();
 var started = Stopwatch.StartNew();
@@ -954,6 +962,7 @@ if (!OperatingSystem.IsWindows())
     var iPlainBefore = File.GetLastWriteTimeUtc(iPlain);
     var iPartial = Tampered(SealedAt(Path.Combine(iWatch, "still arriving.crdownload")));
     var iHidden = Tampered(SealedAt(Path.Combine(iWatch, ".hidden.pdf")));
+    if (OperatingSystem.IsWindows()) File.SetAttributes(iHidden, File.GetAttributes(iHidden) | FileAttributes.Hidden);   // a name with a dot is not hidden on Windows, the attribute is
     var iHiddenDir = Tampered(SealedAt(Path.Combine(iWatch, ".cache", "tucked away.pdf")));
     var iLinkTarget = Tampered(SealedAt(Path.Combine(files, "link target.pdf")));
     if (!OperatingSystem.IsWindows()) File.CreateSymbolicLink(Path.Combine(iWatch, "link.pdf"), iLinkTarget);
@@ -1014,6 +1023,12 @@ if (!OperatingSystem.IsWindows())
         Expect("96e a pass that skips the watched folders leaves them alone", pSkip.Problems == 0 && File.Exists(iSkipped));
         Boxes.RunCheckBoxOnce(iHome, iBox, iNow(), TimeSpan.Zero);
         Expect("96f ...and the next full pass judges the file", !File.Exists(iSkipped));
+
+        // a name that says "still downloading" or starts with a dot is believed only while the file is changing: once it has sat still it is judged like any other
+        var pSettled = Boxes.RunCheckBoxOnce(iHome, iBox, Time.Now().AddMinutes(11), TimeSpan.Zero);
+        Expect("96g partly downloaded and dot named files that have sat still for ten minutes are judged like any other, on both systems", pSettled.Problems == 2
+            && !File.Exists(iPartial) && !File.Exists(iHidden)
+            && File.Exists(Path.Combine(iRej, "still arriving.crdownload")) && File.Exists(Path.Combine(iRej, ".hidden.pdf")), $"problems {pSettled.Problems}: {string.Join(" | ", pSettled.Notes ?? [])}");
 
         // cannot read: left, warned once, tried again later
         if (!OperatingSystem.IsWindows())
@@ -1586,17 +1601,29 @@ if (!OperatingSystem.IsWindows())
         var swapDir = Path.Combine(tempRoot, "swap-files"); Directory.CreateDirectory(swapDir);
         var swapPath = Path.Combine(swapDir, "swap.txt"); File.WriteAllBytes(swapPath, hGenuine);
         var before = new FileInfo(swapPath).LastWriteTimeUtc;
+        var swapRefused = false;
         Checker.AfterHashHook = path =>
         {
             Checker.AfterHashHook = null;
-            File.WriteAllBytes(path + ".other", hGenuine);                 // same size, same bytes: only the date can tell
-            File.SetLastWriteTimeUtc(path + ".other", before.AddMinutes(7));
-            File.Move(path + ".other", path, true);
+            try
+            {
+                File.WriteAllBytes(path + ".other", hGenuine);                 // same size, same bytes: only the date can tell
+                File.SetLastWriteTimeUtc(path + ".other", before.AddMinutes(7));
+                File.Move(path + ".other", path, true);
+            }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+            {
+                // Windows does not let a file that is open for reading be replaced: the swap is refused outright (as access denied or a sharing violation).
+                swapRefused = true;
+                try { File.Delete(path + ".other"); } catch (IOException) { }
+            }
         };
         CheckResult swapped;
         try { swapped = Checker.Check(swapPath, TrustPolicy.FromFolder(hHome.Trust, now), now); }
         finally { Checker.AfterHashHook = null; }
-        Expect("113d a file replaced by another under the check is not called verified", swapped.Status == "CHANGED" && swapped.Reason.Contains("while it was being checked"), $"{swapped.Status}: {swapped.Reason}");
+        Expect("113d a file replaced by another under the check is not called verified (on Windows the swap is refused and the file stays as it was)",
+            swapRefused ? OperatingSystem.IsWindows() && swapped.Status == "VERIFIED" && new FileInfo(swapPath).LastWriteTimeUtc == before
+                        : swapped.Status == "CHANGED" && swapped.Reason.Contains("while it was being checked"), $"{swapped.Status}: {swapped.Reason}");
 
         // approving again after the share failed puts the certificate there instead of refusing for ever
         var aHome = NewCompany("approve-again"); var aShare = Path.Combine(tempRoot, "approve-again-share");
@@ -1673,6 +1700,317 @@ if (!OperatingSystem.IsWindows())
         finally { Time.ReadingZone = normal; }
     }
 }
+
+// ===================================================================================================
+// Windows has no "start it again if it stops" for a Startup file, so the login item starts a supervisor that does it.
+// ===================================================================================================
+{
+    var sFolder = Path.Combine(tempRoot, "supervised box"); Directory.CreateDirectory(sFolder);
+    var sLog = Path.Combine(sFolder, "log.txt");
+    var sHomeText = "C:\\Users\\a\\.sonsetseal";
+    var savedPatience = Boxes.SupervisorLockPatience;
+    var savedLaterPoll = Boxes.SupervisorLockLaterPoll;
+    var savedGrace = Boxes.LoginItemWatch.Grace;
+    Boxes.SupervisorLockPatience = TimeSpan.FromMilliseconds(300);
+    CancellationToken Safe() => new CancellationTokenSource(TimeSpan.FromSeconds(30)).Token;   // a broken loop fails the run instead of hanging it
+
+    // Real programs that stand in for a box: a copy of this test program that only waits (see the top of this file).
+    var spawned = new List<System.Diagnostics.Process>();
+    string SelfProgram() => Environment.ProcessPath!;
+    string[] IdleCopyArguments(int seconds, string? pidFile = null)
+    {
+        var list = new List<string>();
+        if (Path.GetFileNameWithoutExtension(SelfProgram()).Equals("dotnet", StringComparison.OrdinalIgnoreCase)) list.Add(Environment.GetCommandLineArgs()[0]);
+        list.Add("--idle-copy"); list.Add(seconds.ToString());
+        if (pidFile != null) list.Add(pidFile);
+        return [.. list];
+    }
+    System.Diagnostics.Process StartIdleCopy(int seconds)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo(SelfProgram()) { UseShellExecute = false, CreateNoWindow = true };
+        foreach (var argument in IdleCopyArguments(seconds)) info.ArgumentList.Add(argument);
+        var started = System.Diagnostics.Process.Start(info)!;
+        spawned.Add(started);
+        return started;
+    }
+    int WaitForPidFile(string path, int seconds)
+    {
+        for (var i = 0; i < seconds * 10; i++)
+        {
+            try { if (File.Exists(path) && int.TryParse(File.ReadAllText(path).Trim(), out var pid) && pid > 0) return pid; }
+            catch (IOException) { }
+            Thread.Sleep(100);
+        }
+        return -1;
+    }
+    bool ChildGone(int pid)
+    {
+        for (var i = 0; i < 50; i++)
+        {
+            try { using var p = System.Diagnostics.Process.GetProcessById(pid); if (p.HasExited) return true; }
+            catch (ArgumentException) { return true; }
+            Thread.Sleep(100);
+        }
+        return false;
+    }
+
+    try
+    {
+        // ----- what the login items say (the real builders, for both systems)
+        var sWin = Boxes.LoginItemFor("check-box", sFolder, sHomeText, windows: true);
+        Expect("114 the Windows login item runs the supervisor, tells it which login item file it belongs to, and still carries the home folder so uninstall finds it",
+            sWin.Path.EndsWith(".vbs") && sWin.Text.Contains("\"\"supervise\"\"") && sWin.Text.Contains("\"\"--login-item\"\" \"\"" + sWin.Path + "\"\"") && sWin.Text.Contains("\"\"" + sHomeText + "\"\"") && !sWin.Text.Contains("\"\"run\"\""), sWin.Text);
+        var sMac = Boxes.LoginItemFor("seal-box", sFolder, "/h", windows: false);
+        Expect("114b the Mac login item still runs the box itself and leaves the restarting to the system", sMac.Path.EndsWith(".plist") && sMac.Text.Contains("<string>run</string>") && !sMac.Text.Contains("<string>supervise</string>") && sMac.Text.Contains("<key>KeepAlive</key><true/>"));
+        Expect("114c the supervisor starts the box with the same words the login item used to", string.Join("|", Boxes.BoxArguments("seal-box", "F", "H")) == "seal-box|run|--folder|F|--home|H");
+        var accented = Path.Combine(tempRoot, "José login items"); Directory.CreateDirectory(accented);
+        var accentedText = "CreateObject(\"Wscript.Shell\").Run \"\"\"C:\\Users\\José\\sonsetseal.exe\"\" \"\"check-box\"\"\", 0, False\r\n";
+        var winFile = Path.Combine(accented, "item.vbs"); var macFile = Path.Combine(accented, "item.plist");
+        Boxes.WriteLoginItem(winFile, accentedText, windows: true); Boxes.WriteLoginItem(macFile, accentedText, windows: false);
+        var winBytes = File.ReadAllBytes(winFile); var macBytes = File.ReadAllBytes(macFile);
+        Expect("114d a Windows login item is written as UTF 16 with a byte order mark so a name like José survives, and a Mac one stays plain UTF 8",
+            winBytes[0] == 0xFF && winBytes[1] == 0xFE && File.ReadAllText(winFile) == accentedText && macBytes[0] != 0xFF && macBytes[0] != 0xEF && File.ReadAllText(macFile) == accentedText && macBytes.Contains((byte)0xC3));
+        var installedWin = Boxes.WriteLoginItemFor("seal-box", Path.Combine(tempRoot, "José box"), sHomeText, windows: true);
+        var installedBytes = File.ReadAllBytes(installedWin.Path);
+        Expect("114d2 installing a Windows login item writes the file that way, with the accented folder name intact",
+            installedBytes[0] == 0xFF && installedBytes[1] == 0xFE && File.ReadAllText(installedWin.Path).Contains("José box") && Boxes.FolderOfLoginItem(installedWin.Path) == Path.GetFullPath(Path.Combine(tempRoot, "José box")));
+        File.Delete(installedWin.Path);
+
+        // ----- when a login item counts as gone: not on one failed look
+        var watchFile = Path.Combine(tempRoot, "watched login item.vbs"); File.WriteAllText(watchFile, "x");
+        var wNow = DateTimeOffset.Parse("2026-10-27T12:00:00Z");
+        var watch = new Boxes.LoginItemWatch(watchFile, () => wNow);
+        var looks = new List<bool> { watch.Wanted() };
+        File.Delete(watchFile);
+        looks.Add(watch.Wanted());                                                    // just missing
+        wNow = wNow.AddSeconds(4); looks.Add(watch.Wanted());                         // missing 4 seconds
+        File.WriteAllText(watchFile, "x"); wNow = wNow.AddSeconds(1); looks.Add(watch.Wanted());   // back again
+        File.Delete(watchFile); wNow = wNow.AddSeconds(1); looks.Add(watch.Wanted()); // missing again, the count starts over
+        wNow = wNow.AddSeconds(4.9); looks.Add(watch.Wanted());                       // 4.9 seconds
+        wNow = wNow.AddSeconds(0.1); looks.Add(watch.Wanted());                       // 5.0 seconds in a row
+        Expect("114e a login item counts as gone only after it has been missing for five seconds in a row", string.Join(",", looks) == "True,True,True,True,True,True,False", string.Join(",", looks));
+        var unreachable = new Boxes.LoginItemWatch(Path.Combine(tempRoot, "no such folder", "x.vbs"), () => wNow);
+        var unreachableLooks = new[] { unreachable.Wanted(), unreachable.Wanted() };
+        wNow = wNow.AddHours(1);
+        Expect("114f a login item whose folder cannot be reached is not called gone (a network profile that dropped), and no item given means always wanted",
+            unreachableLooks.All(l => l) && unreachable.Wanted() && new Boxes.LoginItemWatch(null).Wanted());
+
+        // ----- the loop, with a pretend box and a pretend clock
+        var sNow = DateTimeOffset.Parse("2026-10-27T12:00:00Z");
+        DateTimeOffset SNow() => sNow;
+        var waits = new List<TimeSpan>();
+        bool Pause(TimeSpan wait, CancellationToken _) { waits.Add(wait); sNow = sNow.Add(wait); return false; }
+        string Seconds() => string.Join(",", waits.Select(w => (int)w.TotalSeconds));
+
+        var crashStop = new CancellationTokenSource();
+        var crashRuns = 0;
+        Boxes.Supervise(sFolder, _ => { crashRuns++; sNow = sNow.AddSeconds(1); if (crashRuns == 8) crashStop.Cancel(); return 1; }, () => true, crashStop.Token, Pause, SNow);
+        Expect("115 a box that ends on its own is started again, after waits that double and stop growing at five minutes", crashRuns == 8 && Seconds() == "10,20,40,80,160,300,300", $"{crashRuns} runs, waits {Seconds()}");
+        var sLines = File.ReadAllLines(sLog);
+        Expect("115b every restart is written to the box's log with the exit code and the wait", sLines.Length == 7 && sLines[0].Contains("SUPERVISOR  the box ended on its own (exit code 1) after 1 seconds. Starting it again in 10 seconds.") && sLines[6].Contains("in 300 seconds"), string.Join(" | ", sLines));
+
+        waits.Clear();
+        var stableRuns = 0; var stableLengths = new[] { 1, 1, 120, 1, 1 };
+        var stableStop = new CancellationTokenSource();
+        Boxes.Supervise(sFolder, _ => { sNow = sNow.AddSeconds(stableLengths[stableRuns]); if (++stableRuns == stableLengths.Length) stableStop.Cancel(); return 0; }, () => true, stableStop.Token, Pause, SNow);
+        Expect("115c a box that ran for a good while before it ended starts the waits over", Seconds() == "10,20,10,20", Seconds());
+
+        waits.Clear();
+        var asked = new CancellationTokenSource(); var askedRuns = 0;
+        var logBefore = File.ReadAllText(sLog);
+        Boxes.Supervise(sFolder, token => { askedRuns++; asked.Cancel(); return -1; }, () => true, asked.Token, Pause, SNow);
+        Expect("116 told to stop while the box runs, the supervisor does not start it again or write a restart", askedRuns == 1 && waits.Count == 0 && File.ReadAllText(sLog) == logBefore);
+
+        var removed = false; var removedRuns = 0;
+        Boxes.Supervise(sFolder, _ => { removedRuns++; removed = true; return 0; }, () => !removed, Safe(), Pause, SNow);
+        var logAfterRemoval = File.ReadAllText(sLog);
+        Expect("116b when the login item is removed the box ends and is not started again, and the log says why", removedRuns == 1 && waits.Count == 0
+            && logAfterRemoval.Length > logBefore.Length && logAfterRemoval.Contains("SUPERVISOR  the login item file is gone"), logAfterRemoval);
+        var neverRuns = 0;
+        Boxes.Supervise(sFolder, _ => { neverRuns++; return 0; }, () => false, Safe(), Pause, SNow);
+        Expect("116c with the login item already gone nothing is started", neverRuns == 0);
+        var pausedStop = new CancellationTokenSource(); var pausedRuns = 0;
+        var logBeforePause = File.ReadAllText(sLog);
+        Boxes.Supervise(sFolder, _ => { pausedRuns++; return 1; }, () => true, pausedStop.Token, (_, _) => { pausedStop.Cancel(); return true; }, SNow);
+        Expect("116d told to stop during the wait before a restart, it stops, and does not say the login item is gone", pausedRuns == 1 && !File.ReadAllText(sLog)[logBeforePause.Length..].Contains("login item file is gone"));
+        var wokenStop = new CancellationTokenSource(); var wokenRuns = 0; var wokenPauses = 0;
+        Boxes.Supervise(sFolder, _ => { if (++wokenRuns == 2) wokenStop.Cancel(); return 1; }, () => true, wokenStop.Token, (_, _) => { wokenPauses++; return true; }, SNow);
+        Expect("116d2 a wait that ended early because the login item looked gone, when the item is back, carries on and starts the box again", wokenRuns == 2 && wokenPauses == 1, $"{wokenRuns} runs, {wokenPauses} waits");
+
+        var midWaitRemoved = false; var midWaitRuns = 0;
+        var midWaitWatch = System.Diagnostics.Stopwatch.StartNew();
+        _ = Task.Run(() => { Thread.Sleep(400); midWaitRemoved = true; });
+        Boxes.Supervise(sFolder, _ => { midWaitRuns++; return 1; }, () => !midWaitRemoved, Safe());
+        Expect("116e the real wait before a restart (ten seconds) ends within a couple of seconds once the login item is gone", midWaitRuns == 1 && midWaitWatch.Elapsed < TimeSpan.FromSeconds(5), $"{midWaitRuns} runs after {midWaitWatch.Elapsed.TotalSeconds:F1}s");
+
+        var cannotStart = 0;
+        var cannotStop = new CancellationTokenSource();
+        Boxes.Supervise(sFolder, _ => { if (++cannotStart == 3) cannotStop.Cancel(); throw new System.ComponentModel.Win32Exception("The system cannot find the file specified"); }, () => true, cannotStop.Token, Pause, SNow);
+        Expect("117 a box that cannot even be started is tried again, and the log says why", cannotStart == 3 && File.ReadAllText(sLog).Contains("exit code -2 (The system cannot find the file specified)"));
+
+        // ----- the real runner, with real programs
+        string[] Quick(int code) => OperatingSystem.IsWindows() ? ["/c", $"exit {code}"] : ["-c", $"exit {code}"];
+        string[] Slow() => OperatingSystem.IsWindows() ? ["/c", "ping -n 40 127.0.0.1 > nul"] : ["-c", "sleep 40"];
+        var shell = OperatingSystem.IsWindows() ? Path.Combine(Environment.SystemDirectory, "cmd.exe") : "/bin/sh";
+        Expect("118 the runner waits for the program to end and gives back its exit code", Boxes.RunProgramUntilItEnds(shell, Quick(3), () => true, CancellationToken.None) == 3);
+        var killPidFile = Path.Combine(tempRoot, "kill one.pid");
+        var keepRunning = true;
+        var endedWatch = System.Diagnostics.Stopwatch.StartNew();
+        _ = Task.Run(() => { WaitForPidFile(killPidFile, 40); keepRunning = false; });
+        var endedHere = Boxes.RunProgramUntilItEnds(SelfProgram(), IdleCopyArguments(120, killPidFile), () => keepRunning, CancellationToken.None);
+        var killedOne = WaitForPidFile(killPidFile, 1);
+        Expect("118b a program that is still running is really ended when the login item goes (and not just given up on)", endedHere == -1 && killedOne > 0 && ChildGone(killedOne), $"{endedHere} after {endedWatch.Elapsed.TotalSeconds:F1}s, pid {killedOne}");
+        var stopPidFile = Path.Combine(tempRoot, "kill two.pid");
+        var cancel = new CancellationTokenSource();
+        _ = Task.Run(() => { WaitForPidFile(stopPidFile, 40); cancel.Cancel(); });
+        var endedByStop = Boxes.RunProgramUntilItEnds(SelfProgram(), IdleCopyArguments(120, stopPidFile), () => true, cancel.Token);
+        var killedTwo = WaitForPidFile(stopPidFile, 1);
+        Expect("118c and when the supervisor is asked to stop", endedByStop == -1 && killedTwo > 0 && ChildGone(killedTwo), $"{endedByStop}, pid {killedTwo}");
+        var cannotRun = false;
+        try { Boxes.RunProgramUntilItEnds(Path.Combine(tempRoot, "no such program"), [], () => true, CancellationToken.None); }
+        catch (System.ComponentModel.Win32Exception) { cannotRun = true; }
+        Expect("118d a program that is not there is an error the supervisor can handle, not a crash", cannotRun);
+
+        // ----- stopping by pid file never touches another program that happens to hold the number
+        var foreign = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(shell, Slow()) { UseShellExecute = false, CreateNoWindow = true })!;
+        spawned.Add(foreign);
+        var pidFolder = Path.Combine(tempRoot, "pid folder"); Directory.CreateDirectory(pidFolder);
+        File.WriteAllText(Boxes.BoxLock.PidFile(pidFolder), foreign.Id.ToString());
+        File.WriteAllText(Boxes.BoxLock.PidFile(pidFolder, "supervisor"), foreign.Id.ToString());
+        Expect("119 a pid file that names some other program is not obeyed: it is left running", !Boxes.StopFromPidFile(pidFolder) && !foreign.HasExited);
+        File.WriteAllText(Boxes.BoxLock.PidFile(pidFolder), "not a number");
+        File.WriteAllText(Boxes.BoxLock.PidFile(pidFolder, "supervisor"), Environment.ProcessId.ToString());
+        Expect("119b a damaged pid file, or one naming this very process, stops nothing", !Boxes.StopFromPidFile(pidFolder) && Boxes.ProcessOfPidFile(Boxes.BoxLock.PidFile(pidFolder)) == null);
+
+        // ... and it does stop a real copy of this program, the supervisor before the box.
+        var stopFolder = Path.Combine(tempRoot, "stop folder"); Directory.CreateDirectory(stopFolder);
+        var boxCopy = StartIdleCopy(120); var supervisorCopy = StartIdleCopy(120);
+        File.WriteAllText(Boxes.BoxLock.PidFile(stopFolder), boxCopy.Id.ToString());
+        File.WriteAllText(Boxes.BoxLock.PidFile(stopFolder, "supervisor"), supervisorCopy.Id.ToString());
+        using (var found = Boxes.ProcessOfPidFile(Boxes.BoxLock.PidFile(stopFolder)))
+            Expect("119c a pid file that names a running copy of this program finds it", found != null && found.Id == boxCopy.Id);
+        File.SetLastWriteTimeUtc(Boxes.BoxLock.PidFile(stopFolder), DateTime.UtcNow.AddHours(-2));
+        Expect("119d a pid file much older than the process it names is not obeyed (the number was reused)", Boxes.ProcessOfPidFile(Boxes.BoxLock.PidFile(stopFolder)) == null);
+        File.SetLastWriteTimeUtc(Boxes.BoxLock.PidFile(stopFolder), DateTime.UtcNow);
+        Expect("119e a supervisor that does not end is waited for only so long", !Boxes.WaitForSupervisorToEnd(stopFolder, TimeSpan.FromMilliseconds(400)) && !supervisorCopy.HasExited);
+        Expect("119f stopping by pid file ends both the supervisor and the box", Boxes.StopFromPidFile(stopFolder) && boxCopy.WaitForExit(5000) && supervisorCopy.WaitForExit(5000));
+        var waitFolder = Path.Combine(tempRoot, "wait folder"); Directory.CreateDirectory(waitFolder);
+        var shortLived = StartIdleCopy(2);
+        File.WriteAllText(Boxes.BoxLock.PidFile(waitFolder, "supervisor"), shortLived.Id.ToString());
+        Expect("119g a supervisor that ends by itself while it is waited for is seen to end", Boxes.WaitForSupervisorToEnd(waitFolder, TimeSpan.FromSeconds(30)) && shortLived.HasExited);
+
+        // removing a login item found by its home folder also stops the box it was made for, which uninstall relies on
+        var rmFolder = Path.Combine(tempRoot, "R&D box folder"); Directory.CreateDirectory(rmFolder);
+        var rmHome = Path.Combine(tempRoot, "rm home");
+        Boxes.InstallAutostart("check-box", rmFolder, rmHome, startNow: false);
+        var rmItem = Boxes.LoginItemsFor(rmHome).Single();
+        var rmCopy = StartIdleCopy(120);
+        File.WriteAllText(Boxes.BoxLock.PidFile(rmFolder), rmCopy.Id.ToString());
+        Expect("119h the folder a login item was made for can be read back from it, even with an ampersand in the name", Boxes.FolderOfLoginItem(rmItem.Path) == Path.GetFullPath(rmFolder), Boxes.FolderOfLoginItem(rmItem.Path) ?? "null");
+        var rmText = Boxes.RemoveLoginItemAt(rmItem.Label, rmItem.Path);
+        Expect("119i removing a discovered login item stops the box that was running for it, and says so", rmCopy.WaitForExit(5000) && !File.Exists(rmItem.Path) && rmText.Contains("stopped it"), rmText);
+        var otherWindows = !OperatingSystem.IsWindows();
+        var otherItem = Boxes.LoginItemFor("seal-box", rmFolder, rmHome, windows: otherWindows);
+        var otherFile = Path.Combine(accented, "other" + (otherWindows ? ".vbs" : ".plist"));
+        Boxes.WriteLoginItem(otherFile, otherItem.Text, otherWindows);
+        Expect("119j and the same for the other system's login item text", Boxes.FolderOfLoginItem(otherFile) == Path.GetFullPath(rmFolder) && Boxes.FolderOfLoginItem(macFile) == null);
+
+        // ----- a login item that cannot be deleted does not stop the removal half way
+        var stuckFolder = Path.Combine(tempRoot, "stuck login items"); Directory.CreateDirectory(stuckFolder);
+        var realOverride = Boxes.LoginItemsFolderOverride;
+        if (Environment.UserName != "root")
+        {
+            Boxes.LoginItemsFolderOverride = stuckFolder;
+            var stuckBox = Path.Combine(tempRoot, "stuck box"); Directory.CreateDirectory(stuckBox);
+            Boxes.InstallAutostart("seal-box", stuckBox, Path.Combine(tempRoot, "stuck home"), startNow: false);
+            var stuckPath = Boxes.LoginItemTarget("seal-box", stuckBox).Path;
+            var stuckCopy = StartIdleCopy(120);
+            File.WriteAllText(Boxes.BoxLock.PidFile(stuckBox), stuckCopy.Id.ToString());
+            try
+            {
+                if (OperatingSystem.IsWindows()) File.SetAttributes(stuckPath, FileAttributes.ReadOnly);
+                else File.SetUnixFileMode(stuckFolder, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+                var stuckText = "";
+                try { stuckText = Boxes.RemoveAutostart("seal-box", stuckBox); }
+                catch (Exception e) { stuckText = "THREW " + e.GetType().Name; }
+                Expect("121 a login item file that cannot be deleted is reported, the box that was running is still stopped, and nothing throws",
+                    stuckText.Contains("was stopped, but its login item file could not be removed") && File.Exists(stuckPath) && stuckCopy.WaitForExit(5000), stuckText);
+            }
+            finally
+            {
+                if (OperatingSystem.IsWindows()) File.SetAttributes(stuckPath, FileAttributes.Normal);
+                else File.SetUnixFileMode(stuckFolder, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                Boxes.LoginItemsFolderOverride = realOverride;
+            }
+        }
+
+        // ----- the lock that makes one supervisor per box
+        var lockFolder = Path.Combine(tempRoot, "supervisor lock folder"); Directory.CreateDirectory(lockFolder);
+        Boxes.SupervisorLockPatience = TimeSpan.FromSeconds(10);
+        Boxes.SupervisorLockLaterPoll = TimeSpan.FromMilliseconds(300);
+        var quickHolder = Boxes.BoxLock.TryTake(lockFolder, "supervisor");
+        _ = Task.Run(() => { Thread.Sleep(700); quickHolder?.Dispose(); });
+        var lockWatch = System.Diagnostics.Stopwatch.StartNew();
+        var lockOut = new StringWriter();
+        using (var tookIt = Boxes.TakeSupervisorLock(lockFolder, () => true, CancellationToken.None, lockOut))
+            Expect("120 a supervisor started a moment before the old one lets go waits for the lock and takes it (setup run again)", tookIt != null && lockWatch.Elapsed < TimeSpan.FromSeconds(6) && lockOut.ToString().Contains("already has a supervisor"), lockOut.ToString());
+        Boxes.SupervisorLockPatience = TimeSpan.FromMilliseconds(200);
+        var lateHolder = Boxes.BoxLock.TryTake(lockFolder, "supervisor");
+        _ = Task.Run(() => { Thread.Sleep(1500); lateHolder?.Dispose(); });
+        lockWatch.Restart();
+        using (var tookLate = Boxes.TakeSupervisorLock(lockFolder, () => true, CancellationToken.None, new StringWriter()))
+            Expect("120b a supervisor that has waited past the first moments still takes over when the holder stops (a second sign in on the same account)", tookLate != null && lockWatch.Elapsed < TimeSpan.FromSeconds(10));
+        using (var holder = Boxes.BoxLock.TryTake(lockFolder, "supervisor"))
+        {
+            var gone = false;
+            _ = Task.Run(() => { Thread.Sleep(600); gone = true; });
+            lockWatch.Restart();
+            Boxes.SupervisorLockPatience = TimeSpan.FromSeconds(10);
+            Expect("120c a supervisor that is waiting gives up when its login item is gone", holder != null && Boxes.TakeSupervisorLock(lockFolder, () => !gone, CancellationToken.None, new StringWriter()) == null && lockWatch.Elapsed < TimeSpan.FromSeconds(6));
+            var stopWaiting = new CancellationTokenSource(); stopWaiting.CancelAfter(600);
+            Expect("120d ... and when it is asked to stop", Boxes.TakeSupervisorLock(lockFolder, () => true, stopWaiting.Token, new StringWriter()) == null);
+            Expect("120e the supervisor lock does not clash with the box's own lock (the box a supervisor starts needs its own)", Boxes.BoxLock.TryTake(sFolder) is { } boxLock && Release(boxLock) && Boxes.BoxLock.TryTake(lockFolder) is { } boxLock2 && Release(boxLock2));
+        }
+        Boxes.SupervisorLockPatience = TimeSpan.FromMilliseconds(300);
+
+        // ----- the command, from the command line to the box it starts (a stand in program replaces the real box)
+        Boxes.LoginItemWatch.Grace = TimeSpan.Zero;   // here a login item that is already gone is called gone at once, and no box is started
+        var sHome = Path.Combine(tempRoot, "supervise-home");
+        var missingItem = Path.Combine(tempRoot, "no such login item.vbs");
+        var superviseGone = Cli("check-box", "supervise", "--folder", sFolder, "--home", sHome, "--login-item", missingItem);
+        Expect("121b the supervise command ends at once when its login item is already gone, says why in the log, and lets go of its lock",
+            superviseGone.Code == 0 && File.ReadAllText(sLog).TrimEnd().EndsWith("if the login item is put back.") && Boxes.BoxLock.TryTake(sFolder, "supervisor") is { } taken && Release(taken));
+        using (var holder = Boxes.BoxLock.TryTake(sFolder, "supervisor"))
+        {
+            var second = Cli("seal-box", "supervise", "--folder", sFolder, "--home", sHome, "--login-item", missingItem);
+            Expect("121c a second supervisor for the same box does not start a second box, and says so", holder != null && second.Code == 0 && second.Out.Contains("already has a supervisor") && !second.Out.Contains("Keeping the box running"), second.Out);
+        }
+
+        var glueFolder = Path.Combine(tempRoot, "glue box"); var glueHome = Path.Combine(tempRoot, "glue home");
+        var glueItem = Path.Combine(tempRoot, "glue login item.vbs"); File.WriteAllText(glueItem, "x");
+        var gluePidFile = Path.Combine(tempRoot, "glue child.pid");
+        (string Group, string Folder, string Home)? seenByStarter = null;
+        Boxes.WorkerStarter = (group, folder, homeRoot) => { seenByStarter = (group, folder, homeRoot); return (SelfProgram(), IdleCopyArguments(120, gluePidFile)); };
+        Boxes.LoginItemWatch.Grace = TimeSpan.FromSeconds(1);
+        var glueRun = Task.Run(() => Cli("seal-box", "supervise", "--folder", glueFolder, "--home", glueHome, "--login-item", glueItem));
+        var gluePid = WaitForPidFile(gluePidFile, 60);
+        Expect("122 the supervise command starts the box with the group, folder and home it was given", gluePid > 0 && seenByStarter is { } s && s.Group == "seal-box" && s.Folder == Path.GetFullPath(glueFolder) && Path.GetFullPath(s.Home) == Path.GetFullPath(glueHome), seenByStarter?.ToString() ?? "never started");
+        File.Delete(glueItem);
+        var glueDone = glueRun.Wait(TimeSpan.FromSeconds(60));
+        Expect("122b removing the login item ends the supervisor, the box it started, and releases the lock", glueDone && glueRun.Result.Code == 0 && gluePid > 0 && ChildGone(gluePid) && Boxes.BoxLock.TryTake(glueFolder, "supervisor") is { } glueLock && Release(glueLock),
+            glueDone ? glueRun.Result.Out : "the supervisor did not end");
+    }
+    finally
+    {
+        Boxes.SupervisorLockPatience = savedPatience;
+        Boxes.SupervisorLockLaterPoll = savedLaterPoll;
+        Boxes.LoginItemWatch.Grace = savedGrace;
+        Boxes.WorkerStarter = null;
+        foreach (var child in spawned) { try { child.Kill(true); } catch (InvalidOperationException) { } child.Dispose(); }
+    }
+}
+
+static bool Release(IDisposable d) { d.Dispose(); return true; }
 
 // ---------------------------------------------------------------------------------- done
 try { Directory.Delete(tempRoot, true); } catch (IOException) { }

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+Windows
+
+- A box that stops on Windows (a crash, or someone ending it) now starts again by itself. The Startup file runs a small supervisor that starts the box again after 10 seconds, then 20, 40 and so on up to 5 minutes if it keeps falling over, and writes each restart to the box log. Removing the login item, or running `uninstall`, stops the supervisor and the box together.
+- The Startup file is written so that user names with accents, such as José, work.
+- `uninstall` also stops the box of a login item that it only finds in the Startup folder.
+- All the automated checks pass on Windows (358 of 358, and 377 on a Mac). The earlier failures were four wrong tests, not faults in the program: a file name Windows refuses, a hidden file rule, a file that cannot be replaced while it is open, and a difference in wording. One new check now judges partly downloaded files the same way on both systems.
+
 ## 0.4.0 (first public release)
 
 The tool existed as a private project before this. This is the first published version, after two rounds of code review. Here is what the review changed.

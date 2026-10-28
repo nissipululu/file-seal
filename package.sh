@@ -43,6 +43,8 @@ WHAT IT IS
 One small program with no installer service and no account. It lets a company seal files with its own certificate
 authority and check the seal before a file is opened. If you use the automatic folders (below), it runs two small
 background programs in the user's own login session, one for the Seal box and one for the Check box, started by a login item.
+On Windows each box also has a small supervisor (the same sonsetseal.exe, started with the word "supervise") that starts the box
+again if it ever stops, so Task Manager shows two sonsetseal.exe entries per box.
 It holds no data of ours. Sonset runs nothing for you and keeps no keys, certificates or files.
 
 WHAT IT DOES ON THE NETWORK
@@ -118,7 +120,12 @@ LOGIN ITEMS (setup does this for you; this is only if you want to manage them by
 --install writes the login item and starts the box now. It is one small file in the user's own LaunchAgents folder on a
 Mac, or in the user's Startup folder on Windows. Each login item has its own name, made from the box folder's full
 path, so several boxes on one computer never clash. A box starts again by itself if it ever stops, and only one copy
-of a box runs at a time.
+of a box runs at a time. On a Mac the system does the restarting. On Windows the Startup file runs the supervisor: it
+starts the box again 10 seconds after it ends, then 20, 40 and so on up to 5 minutes if it keeps falling over, and writes
+each restart to log.txt in the box folder. Ending a box in Task Manager therefore only restarts it. To stop a box for good
+use "autostart --remove" or "uninstall" (or delete the login item file: the supervisor and the box then stop by themselves
+within about ten seconds). If someone ends the supervisor by hand, the box keeps running but is not restarted if it stops,
+until the next sign in or until "autostart --install" is run again.
 
 REMOVE IT
   sonsetseal uninstall

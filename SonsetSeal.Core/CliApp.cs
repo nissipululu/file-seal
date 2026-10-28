@@ -31,9 +31,11 @@ public static class CliApp
         ["seal-box setup"] = new(["--folder", "--department", "--made-by", "--made-for", "--rights", "--contact", "--edits", "--reference", "--share", "--notify", "--pin-root", "--home"], []),
         ["seal-box run"] = new(["--folder", "--settle", "--home"], ["--once"]),
         ["seal-box autostart"] = new(["--folder", "--home"], ["--install", "--remove"]),
+        ["seal-box supervise"] = new(["--folder", "--home", "--login-item"], []),
         ["check-box setup"] = new(["--folder", "--trust", "--trust-share", "--pin-root", "--also-watch", "--notify", "--home"], ["--trust-on-first-use"]),
         ["check-box run"] = new(["--folder", "--settle", "--home"], ["--once"]),
         ["check-box autostart"] = new(["--folder", "--home"], ["--install", "--remove"]),
+        ["check-box supervise"] = new(["--folder", "--home", "--login-item"], []),
     };
 
     /// <summary>Test only options (a pretend clock, a chosen seal date). They are refused unless the test program turns them on inside its own process, so nobody can backdate with them in real use.</summary>
@@ -138,6 +140,7 @@ public static class CliApp
           check-box setup --folder "Check box" (--trust TRUSTFOLDER | --trust-share SHARE) [--pin-root SHA256 | --trust-on-first-use] [--also-watch FOLDER ...] [--notify all|problems|off]
           check-box run --folder "Check box"        (files arriving in 'Incoming' land in 'Verified' or 'Rejected')
           seal-box autostart --folder ... [--install | --remove]   (and the same for check-box: start at login, or stop and remove)
+          seal-box supervise --folder ...           (runs the box and starts it again if it ever stops; the Windows login item uses this)
 
         Anyone who receives files:
           check FILE_OR_FOLDER... --trust TRUSTFOLDER [--pin-root SHA256FINGERPRINT]
@@ -255,6 +258,8 @@ public static class CliApp
                 // The loop looks at Incoming every pass and at the other watched folders every fifth pass, since those can be large.
                 return RunBox(a, o, folder, (at, settle, count) => Boxes.RunCheckBoxOnce(home, folder, at, settle, count % 5 == 0));
             }
+            case ("seal-box" or "check-box", "supervise"):
+                return SuperviseBox(group, a, home, o);
             case ("seal-box" or "check-box", "autostart"):
                 return Autostart(group, a, home, o);
             default:
@@ -311,19 +316,48 @@ public static class CliApp
             return report.Problems == 0 && !(report.Notes ?? []).Any(n => n.Alert) ? 0 : 1;
         }
         using var stop = new CancellationTokenSource();
+        var registrations = StopOnRequest(stop);
+        using var held = TakeBox(folder, o, stop.Token);
+        if (held == null) return 0;
+        o.WriteLine("Watching. Press Control C to stop.");
+        var count = 0;
+        Boxes.RunLoop(() => pass(DateTimeOffset.UtcNow, settle, count++), o, stop.Token, () => Boxes.NotifyMode(folder));
+        foreach (var r in registrations) r.Dispose();
+        return 0;
+    }
+
+    /// <summary>Control C, and a stop request from the system (a login item being removed, the computer shutting down), end the loop cleanly.</summary>
+    private static List<IDisposable> StopOnRequest(CancellationTokenSource stop)
+    {
         Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.Cancel(); };
-        // A stop request from the system (a login item being removed, the computer shutting down) ends the loop cleanly.
         var registrations = new List<IDisposable>();
         foreach (var signal in new[] { System.Runtime.InteropServices.PosixSignal.SIGTERM, System.Runtime.InteropServices.PosixSignal.SIGHUP })
         {
             try { registrations.Add(System.Runtime.InteropServices.PosixSignalRegistration.Create(signal, ctx => { ctx.Cancel = true; stop.Cancel(); })); }
             catch (Exception e) when (e is PlatformNotSupportedException or ArgumentException) { }
         }
-        using var held = TakeBox(folder, o, stop.Token);
-        if (held == null) return 0;
-        o.WriteLine("Watching. Press Control C to stop.");
-        var count = 0;
-        Boxes.RunLoop(() => pass(DateTimeOffset.UtcNow, settle, count++), o, stop.Token, () => Boxes.NotifyMode(folder));
+        return registrations;
+    }
+
+    /// <summary>
+    /// Runs a box and starts it again whenever it ends (this is what the Windows login item runs). With --login-item it also ends,
+    /// taking the box with it, when that login item file is gone. Only one supervisor looks after a box.
+    /// </summary>
+    private static int SuperviseBox(string group, Args a, Home home, TextWriter o)
+    {
+        var folder = Path.GetFullPath(a.Need("--folder"));
+        var loginItem = a.One("--login-item");
+        using var stop = new CancellationTokenSource();
+        var registrations = StopOnRequest(stop);
+        Func<bool> wanted = new Boxes.LoginItemWatch(loginItem).Wanted;
+        using var lockHeld = Boxes.TakeSupervisorLock(folder, wanted, stop.Token, o);
+        if (lockHeld == null) return 0;
+        o.WriteLine("Keeping the box running, and starting it again if it ever stops. Press Control C to stop.");
+        Boxes.Supervise(folder, token =>
+        {
+            var (exe, arguments) = Boxes.WorkerFor(group, folder, home.Root);
+            return Boxes.RunProgramUntilItEnds(exe, arguments, wanted, token);
+        }, wanted, stop.Token);
         foreach (var r in registrations) r.Dispose();
         return 0;
     }

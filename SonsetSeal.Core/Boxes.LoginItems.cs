@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
 namespace SonsetSeal;
 
@@ -65,26 +66,31 @@ public static partial class Boxes
     /// Where a box's login item lives and what it is called. The name carries a short code made from the box folder's full path,
     /// so two boxes with the same folder name in different places never share a login item.
     /// </summary>
-    public static (string Label, string Path) LoginItemTarget(string group, string folder)
+    public static (string Label, string Path) LoginItemTarget(string group, string folder) => LoginItemTarget(group, folder, OperatingSystem.IsWindows());
+
+    internal static (string Label, string Path) LoginItemTarget(string group, string folder, bool windows)
     {
         folder = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar);
         string slug;
         try { slug = Names.Slug(Path.GetFileName(folder)); } catch (SealException) { slug = "box"; }
         var code = ShortHash(folder);
-        if (OperatingSystem.IsWindows()) return ($"Sonset {group} {slug} {code}", Path.Combine(LoginItemsFolder(), $"Sonset {group} {slug} {code}.vbs"));
+        if (windows) return ($"Sonset {group} {slug} {code}", Path.Combine(LoginItemsFolder(), $"Sonset {group} {slug} {code}.vbs"));
         var label = $"ca.sonset.sealtool.{group}.{slug}.{code}";
         return (label, Path.Combine(LoginItemsFolder(), label + ".plist"));
     }
 
     /// <summary>The start at login file for one box on this computer, and where it belongs.</summary>
-    public static LoginItem LoginItemFor(string group, string folder, string homeRoot)
+    public static LoginItem LoginItemFor(string group, string folder, string homeRoot) => LoginItemFor(group, folder, homeRoot, OperatingSystem.IsWindows());
+
+    internal static LoginItem LoginItemFor(string group, string folder, string homeRoot, bool windows)
     {
         folder = Path.GetFullPath(folder);
         var exe = Environment.ProcessPath ?? throw new SealException("I cannot tell where this program lives.");
-        var arguments = new[] { group, "run", "--folder", folder, "--home", homeRoot };
-        var (label, path) = LoginItemTarget(group, folder);
-        if (OperatingSystem.IsWindows()) return new LoginItem(label, path, WindowsStartupScript(exe, arguments));
-        return new LoginItem(label, path, MacLaunchAgent(label, exe, arguments, Path.Combine(folder, "launchd.log")));
+        var (label, path) = LoginItemTarget(group, folder, windows);
+        // A Mac restarts a box that stops, because the login item says so. Windows has no such setting for a Startup file, so there the
+        // login item starts a supervisor that does it (see Supervise).
+        if (windows) return new LoginItem(label, path, WindowsStartupScript(exe, SupervisorArguments(group, folder, homeRoot, path)));
+        return new LoginItem(label, path, MacLaunchAgent(label, exe, BoxArguments(group, folder, homeRoot), Path.Combine(folder, "launchd.log")));
     }
 
     private static string CurrentUid()
@@ -104,13 +110,24 @@ public static partial class Boxes
         return (p.ExitCode, (err.Result + outText.Result).Trim());
     }
 
+    /// <summary>A Windows script file reads a letter such as é in a path (a user called José) right only as UTF 16 with a byte order mark. A Mac login item is plain UTF 8.</summary>
+    internal static void WriteLoginItem(string path, string text, bool windows) =>
+        File.WriteAllText(path, text, windows ? new UnicodeEncoding(false, true) : new UTF8Encoding(false));
+
+    /// <summary>Makes the login item for a box and writes it where it belongs, in the form the system needs.</summary>
+    internal static LoginItem WriteLoginItemFor(string group, string folder, string homeRoot, bool windows)
+    {
+        var item = LoginItemFor(group, folder, homeRoot, windows);
+        Directory.CreateDirectory(Path.GetDirectoryName(item.Path)!);
+        WriteLoginItem(item.Path, item.Text, windows);
+        return item;
+    }
+
     /// <summary>Writes the login file and starts the box now, so nobody has to log out and in. Says honestly what happened.</summary>
     public static string InstallAutostart(string group, string folder, string homeRoot, bool startNow)
     {
-        var item = LoginItemFor(group, folder, homeRoot);
+        var item = WriteLoginItemFor(group, folder, homeRoot, OperatingSystem.IsWindows());
         var name = Pretty(group);
-        Directory.CreateDirectory(Path.GetDirectoryName(item.Path)!);
-        File.WriteAllText(item.Path, item.Text);
         if (!startNow) return $"{name} will start at the next login.";
         try
         {
@@ -152,9 +169,23 @@ public static partial class Boxes
             if (OperatingSystem.IsMacOS()) stopped = Launchctl("bootout", $"gui/{CurrentUid()}/{label}").Code == 0;
         }
         catch (Exception e) when (e is IOException or InvalidOperationException or System.ComponentModel.Win32Exception) { }
-        if (folder != null) stopped |= StopFromPidFile(folder);
-        if (existed) File.Delete(path);
+        // The login item file goes first. A supervisor looking after the box ends the box and then itself a few seconds after the file is
+        // gone, and never starts it again; whatever is still running after that is stopped here, the supervisor before the box.
+        string? couldNotDelete = null;
+        if (existed)
+        {
+            try { File.Delete(path); }
+            catch (Exception e) when (e is IOException or UnauthorizedAccessException) { couldNotDelete = e.Message; }
+        }
+        if (folder != null)
+        {
+            // A supervisor whose file is still there will not end by itself, so there is nothing to wait for.
+            if (couldNotDelete == null) stopped |= WaitForSupervisorToEnd(folder, TimeSpan.FromSeconds(15));
+            stopped |= StopFromPidFile(folder);
+        }
         var lower = name.ToLowerInvariant();
+        if (couldNotDelete != null)
+            return $"{name} {(stopped ? "was stopped" : "is not running")}, but its login item file could not be removed ({Display.Safe(couldNotDelete)}), so it starts again at the next login. Remove {Display.Safe(path)} yourself.";
         if (existed) return stopped ? $"Removed the login item for {lower} and stopped it." : $"Removed the login item for {lower}. It was not running.";
         return stopped ? $"{name} had no login item file, but a copy was running and has been stopped." : $"{name} had no login item.";
     }
@@ -187,6 +218,21 @@ public static partial class Boxes
         return found;
     }
 
-    /// <summary>Removes one discovered login item (see LoginItemsFor).</summary>
-    public static string RemoveLoginItemAt(string label, string path) => RemoveLoginItem(label, path, "a box", null);
+    /// <summary>The box folder a login item file was made for, read from the file. Null when it cannot be told.</summary>
+    internal static string? FolderOfLoginItem(string path)
+    {
+        try
+        {
+            var text = File.ReadAllText(path);
+            var plist = Regex.Match(text, "<string>--folder</string>\\s*<string>([^<]*)</string>");
+            var folder = plist.Success
+                ? plist.Groups[1].Value.Replace("&lt;", "<").Replace("&gt;", ">").Replace("&amp;", "&")
+                : Regex.Match(text, "\"\"--folder\"\"\\s+\"\"([^\"]+)\"\"") is { Success: true } script ? script.Groups[1].Value : null;
+            return folder != null && Path.IsPathFullyQualified(folder) ? folder : null;
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException) { return null; }
+    }
+
+    /// <summary>Removes one discovered login item (see LoginItemsFor), and stops the box it was made for if that box is running.</summary>
+    public static string RemoveLoginItemAt(string label, string path) => RemoveLoginItem(label, path, "a box", FolderOfLoginItem(path));
 }

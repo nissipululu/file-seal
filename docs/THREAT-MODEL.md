@@ -93,7 +93,7 @@ The authority's secret key is a plain owner only file. It isn't protected by a p
 
 A new checking computer has no memory of older lists. The protection against putting back an older list of withdrawn certificates starts from the first list a computer sees.
 
-Windows is less tested. An earlier build ran the whole flow on Windows 11 for Arm in a virtual machine. The attack tests don't pass there yet, this release hasn't been run on Windows, and a box stopped by force doesn't restart until the next sign in.
+Windows is less tested than the Mac. This release ran the whole flow on Windows 11 for Arm in a virtual machine, and all the automated checks pass there, but it has not been tried on a physical Windows computer. A box that stops on Windows is started again by a small supervisor that the Startup file runs. If someone ends the supervisor itself by hand, the box keeps running but is not restarted until the next sign in. The program is not signed, so Windows may warn about an unknown publisher until IT allows it by its fingerprint.
 
 Releases aren't code signed or notarized yet. Check them against `SHA256SUMS`, or build from source.
 
