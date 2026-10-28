@@ -27,7 +27,7 @@ The latest release. This is a young project run by one small company, so fixes g
 
 ## Checking what you download
 
-Each release has a `SHA256SUMS` file listing the SHA 256 fingerprint of every file. Run `shasum -a 256 -c SHA256SUMS` (or `sha256sum -c SHA256SUMS`) in the folder you downloaded to. The downloads aren't code signed or notarized yet. If you build from source with the pinned SDK you get the same file byte for byte, so you can compare your own build with the release.
+Each release has a `SHA256SUMS` file listing the SHA 256 fingerprint of every file. Run `shasum -a 256 -c SHA256SUMS` (or `sha256sum -c SHA256SUMS`) in the folder you downloaded to. The downloads aren't code signed or notarized yet. If you build from source with the pinned SDK you get the same programs and the same Windows zip, byte for byte, so you can compare your own build with the release. The Mac installer package is the exception, because it records when it was built.
 
 ## What the project promises about itself
 
