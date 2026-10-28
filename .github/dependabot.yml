@@ -1,0 +1,7 @@
+# The program has no outside packages. The only things that can go out of date are the automation steps themselves.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

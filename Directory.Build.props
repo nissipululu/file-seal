@@ -1,0 +1,11 @@
+<Project>
+  <!-- Settings shared by every project. A build from the same source gives the same file, whoever builds it and wherever. -->
+  <PropertyGroup>
+    <Version>0.4.0</Version>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <PathMap>$(MSBuildThisFileDirectory)=/src/</PathMap>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+</Project>

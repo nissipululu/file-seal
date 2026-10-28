@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="SonsetSeal.Cli/SonsetSeal.Cli.csproj" />
+  <Project Path="SonsetSeal.Core/SonsetSeal.Core.csproj" />
+  <Project Path="SonsetSeal.Tests/SonsetSeal.Tests.csproj" />
+</Solution>

@@ -1,0 +1,19 @@
+# Build output
+bin/
+obj/
+out/
+release/
+*.user
+
+# Keys and settings must never be committed
+*.key
+*.key.pem
+key.pem
+*.pfx
+*.p12
+.sonsetseal/
+home/
+
+# Local trials
+*.sealed.*
+.DS_Store
